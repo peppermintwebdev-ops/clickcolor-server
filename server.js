@@ -1,7 +1,11 @@
 const express = require('express');
-const app = express();
+const crypto  = require('crypto');
+const https   = require('https');
+
+const app  = express();
 const PORT = process.env.PORT || 3000;
 
+app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
 app.use(function(req, res, next) {
