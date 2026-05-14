@@ -5,19 +5,17 @@ const fetch   = (...args) => import('node-fetch').then(({default: f}) => f(...ar
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── ENV VARS (set these in Railway dashboard) ──
-const SHOPIFY_STORE        = process.env.SHOPIFY_STORE;        // e.g. yourstore.myshopify.com
-const SHOPIFY_ADMIN_TOKEN  = process.env.SHOPIFY_ADMIN_TOKEN;  // Admin API access token
-const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET; // Webhook signing secret
-const NOTIFY_EMAIL         = process.env.NOTIFY_EMAIL;         // Your email for notifications
-const SENDGRID_API_KEY     = process.env.SENDGRID_API_KEY;     // SendGrid API key
+// ── ENV VARS (set in Railway dashboard) ──
+const SHOPIFY_STORE            = process.env.SHOPIFY_STORE;           // yourstore.myshopify.com
+const SHOPIFY_STOREFRONT_TOKEN = process.env.SHOPIFY_STOREFRONT_TOKEN;// shpss_xxx
+const SHOPIFY_WEBHOOK_SECRET   = process.env.SHOPIFY_WEBHOOK_SECRET;  // from Shopify webhook page
+const NOTIFY_EMAIL             = process.env.NOTIFY_EMAIL;            // your email
+const SENDGRID_API_KEY         = process.env.SENDGRID_API_KEY;        // SG.xxx
 
 // ── MIDDLEWARE ──
-// Raw body needed for webhook signature verification
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
-// Allow requests from your Shopify store
 app.use(function(req, res, next) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -32,14 +30,21 @@ app.get('/', function(req, res) {
 });
 
 // ══════════════════════════════════════════
-// WEBHOOK — Shopify calls this when someone
-// completes a subscription checkout
+// WEBHOOK — Shopify fires this when a
+// subscription payment goes through.
+// We store the subscriber email in memory
+// and send you a notification email.
 // ══════════════════════════════════════════
+
+// In-memory subscriber store
+// (survives until server restarts — good enough for starters)
+var subscribers = {};
+
 app.post('/webhook/orders/paid', async function(req, res) {
-  // 1. Verify the request actually came from Shopify
-  const hmac      = req.headers['x-shopify-hmac-sha256'];
-  const body      = req.body; // raw buffer
-  const digest    = crypto
+  // 1. Verify request came from Shopify
+  const hmac   = req.headers['x-shopify-hmac-sha256'];
+  const body   = req.body;
+  const digest = crypto
     .createHmac('sha256', SHOPIFY_WEBHOOK_SECRET)
     .update(body)
     .digest('base64');
@@ -55,50 +60,21 @@ app.post('/webhook/orders/paid', async function(req, res) {
   catch(e) { return res.sendStatus(400); }
 
   const customerEmail = order.email;
-  const customerId    = order.customer && order.customer.id;
-
-  if (!customerId) {
-    console.log('No customer on order — skipping');
+  if (!customerEmail) {
+    console.log('No email on order — skipping');
     return res.sendStatus(200);
   }
 
-  console.log('New subscription order for:', customerEmail);
+  // 3. Mark as subscriber in memory
+  subscribers[customerEmail.toLowerCase()] = {
+    subscribedAt: new Date().toISOString(),
+    orderNumber:  order.order_number,
+    amount:       order.total_price
+  };
 
-  // 3. Tag the customer as pro_subscriber in Shopify
-  try {
-    // First get existing tags so we don't overwrite them
-    const customerRes = await fetch(
-      `https://${SHOPIFY_STORE}/admin/api/2024-01/customers/${customerId}.json`,
-      { headers: { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN } }
-    );
-    const customerData = await customerRes.json();
-    const existingTags = customerData.customer.tags || '';
+  console.log('New Pro subscriber:', customerEmail);
 
-    // Add pro_subscriber tag if not already there
-    const tagsArray = existingTags.split(',').map(t => t.trim()).filter(Boolean);
-    if (!tagsArray.includes('pro_subscriber')) {
-      tagsArray.push('pro_subscriber');
-    }
-    const newTags = tagsArray.join(', ');
-
-    await fetch(
-      `https://${SHOPIFY_STORE}/admin/api/2024-01/customers/${customerId}.json`,
-      {
-        method: 'PUT',
-        headers: {
-          'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ customer: { id: customerId, tags: newTags } })
-      }
-    );
-
-    console.log('Tagged customer as pro_subscriber:', customerEmail);
-  } catch(e) {
-    console.error('Failed to tag customer:', e.message);
-  }
-
-  // 4. Email you a notification
+  // 4. Email you a notification via SendGrid
   if (SENDGRID_API_KEY && NOTIFY_EMAIL) {
     try {
       await fetch('https://api.sendgrid.com/v3/mail/send', {
@@ -113,13 +89,22 @@ app.post('/webhook/orders/paid', async function(req, res) {
           subject: '🎉 New ClickColor Pro subscriber!',
           content: [{
             type: 'text/plain',
-            value: `New subscriber!\n\nEmail: ${customerEmail}\nOrder: #${order.order_number}\nAmount: $${order.total_price}\n\nThey have been automatically tagged as pro_subscriber.`
+            value: [
+              'New subscriber!',
+              '',
+              'Email:  ' + customerEmail,
+              'Order:  #' + order.order_number,
+              'Amount: $' + order.total_price,
+              'Date:   ' + new Date().toLocaleString(),
+              '',
+              'They will automatically get Pro access next time they log in.'
+            ].join('\n')
           }]
         })
       });
-      console.log('Notification email sent to:', NOTIFY_EMAIL);
+      console.log('Notification sent to:', NOTIFY_EMAIL);
     } catch(e) {
-      console.error('Failed to send notification email:', e.message);
+      console.error('Failed to send notification:', e.message);
     }
   }
 
@@ -127,8 +112,9 @@ app.post('/webhook/orders/paid', async function(req, res) {
 });
 
 // ══════════════════════════════════════════
-// LOGIN — checks customer tags against
-// Shopify and returns isPro status
+// LOGIN — authenticates via Shopify
+// Storefront API, checks subscriber list,
+// returns isPro status to your page
 // ══════════════════════════════════════════
 app.post('/login', async function(req, res) {
   const { email, password } = req.body;
@@ -138,18 +124,21 @@ app.post('/login', async function(req, res) {
   }
 
   try {
-    // Use Shopify Storefront API to authenticate the customer
+    // Step 1: get a customer access token from Shopify
     const tokenRes = await fetch(
-      `https://${SHOPIFY_STORE}/api/2024-01/graphql.json`,
+      'https://' + SHOPIFY_STORE + '/api/2024-01/graphql.json',
       {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Shopify-Storefront-Access-Token': process.env.SHOPIFY_STOREFRONT_TOKEN
+          'X-Shopify-Storefront-Access-Token': SHOPIFY_STOREFRONT_TOKEN
         },
         body: JSON.stringify({
           query: `mutation {
-            customerAccessTokenCreate(input: { email: "${email}", password: "${password}" }) {
+            customerAccessTokenCreate(input: {
+              email: "${email.replace(/"/g, '')}",
+              password: "${password.replace(/"/g, '')}"
+            }) {
               customerAccessToken { accessToken }
               customerUserErrors { message }
             }
@@ -159,6 +148,11 @@ app.post('/login', async function(req, res) {
     );
 
     const tokenData = await tokenRes.json();
+
+    if (!tokenData.data || !tokenData.data.customerAccessTokenCreate) {
+      return res.status(500).json({ error: 'Could not reach Shopify. Please try again.' });
+    }
+
     const result = tokenData.data.customerAccessTokenCreate;
 
     if (result.customerUserErrors.length > 0) {
@@ -167,15 +161,14 @@ app.post('/login', async function(req, res) {
 
     const accessToken = result.customerAccessToken.accessToken;
 
-    // Get customer details including tags
+    // Step 2: get customer name and order history
     const customerRes = await fetch(
-      `https://${SHOPIFY_STORE}/api/2024-01/graphql.json`,
+      'https://' + SHOPIFY_STORE + '/api/2024-01/graphql.json',
       {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Shopify-Storefront-Access-Token': process.env.SHOPIFY_STOREFRONT_TOKEN,
-          'X-Shopify-Customer-Access-Token': accessToken
+          'X-Shopify-Storefront-Access-Token': SHOPIFY_STOREFRONT_TOKEN
         },
         body: JSON.stringify({
           query: `{
@@ -183,7 +176,20 @@ app.post('/login', async function(req, res) {
               firstName
               lastName
               email
-              tags
+              orders(first: 20) {
+                edges {
+                  node {
+                    financialStatus
+                    lineItems(first: 5) {
+                      edges {
+                        node {
+                          title
+                        }
+                      }
+                    }
+                  }
+                }
+              }
             }
           }`
         })
@@ -191,16 +197,41 @@ app.post('/login', async function(req, res) {
     );
 
     const customerData = await customerRes.json();
-    const customer = customerData.data.customer;
+    const customer = customerData.data && customerData.data.customer;
 
     if (!customer) {
       return res.status(401).json({ error: 'Could not retrieve account details.' });
     }
 
-    const isPro = customer.tags.includes('pro_subscriber');
-    const name  = [customer.firstName, customer.lastName].filter(Boolean).join(' ') || email;
+    const name = [customer.firstName, customer.lastName].filter(Boolean).join(' ') || email;
 
-    return res.json({ name, email, isPro });
+    // Step 3: check if Pro
+    // Two ways someone can be Pro:
+    // A) Their email is in our webhook subscriber list
+    // B) They have a paid order containing "ClickColor Pro" in the line items
+    var isPro = false;
+
+    // Check A — webhook list
+    if (subscribers[email.toLowerCase()]) {
+      isPro = true;
+    }
+
+    // Check B — order history
+    if (!isPro && customer.orders && customer.orders.edges) {
+      customer.orders.edges.forEach(function(edge) {
+        var order = edge.node;
+        if (order.financialStatus === 'PAID') {
+          order.lineItems.edges.forEach(function(item) {
+            var title = (item.node.title || '').toLowerCase();
+            if (title.includes('clickcolor') || title.includes('pro')) {
+              isPro = true;
+            }
+          });
+        }
+      });
+    }
+
+    return res.json({ name: name, email: email, isPro: isPro });
 
   } catch(e) {
     console.error('Login error:', e.message);
