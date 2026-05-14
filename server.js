@@ -1,6 +1,6 @@
 const express = require('express');
 const crypto  = require('crypto');
-const fetch   = (...args) => import('node-fetch').then(({default: f}) => f(...args));
+const fetch = require('node-fetch');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
