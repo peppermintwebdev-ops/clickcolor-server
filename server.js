@@ -66,8 +66,8 @@ app.get('/', function(req, res) {
 // ══════════════════════════════════════
 app.post('/create-checkout', async function(req, res) {
   var email       = (req.body.email || '').trim();
-  var successUrl  = req.body.successUrl || 'https://your-netlify-site.netlify.app?pro=true';
-  var cancelUrl   = req.body.cancelUrl  || 'https://your-netlify-site.netlify.app';
+var successUrl  = req.body.successUrl || process.env.SUCCESS_URL + '?pro=true';
+var cancelUrl   = req.body.cancelUrl  || process.env.CANCEL_URL;
 
   try {
     var session = await stripeRequest('POST', '/checkout/sessions', {
