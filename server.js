@@ -4,9 +4,11 @@ const https   = require('https');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-const SHOPIFY_STORE            = process.env.SHOPIFY_STORE;
-const SHOPIFY_STOREFRONT_TOKEN = process.env.SHOPIFY_STOREFRONT_TOKEN;
+const STRIPE_SECRET     = process.env.STRIPE_SECRET;
+const STRIPE_WEBHOOK    = process.env.STRIPE_WEBHOOK;
+const STRIPE_PRICE_ID   = process.env.STRIPE_PRICE_ID;
 
+app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
 app.use(function(req, res, next) {
@@ -17,23 +19,24 @@ app.use(function(req, res, next) {
   next();
 });
 
-app.get('/', function(req, res) {
-  res.json({ status: 'ClickColor server running' });
-});
-
-function shopifyQuery(query) {
+// helper — stripe API calls
+function stripeRequest(method, path, data) {
   return new Promise(function(resolve, reject) {
-    var body = JSON.stringify({ query: query });
+    var body = data ? Object.keys(data).map(function(k) {
+      return encodeURIComponent(k) + '=' + encodeURIComponent(data[k]);
+    }).join('&') : '';
+
     var options = {
-      hostname: SHOPIFY_STORE,
-      path: '/api/2024-01/graphql.json',
-      method: 'POST',
+      hostname: 'api.stripe.com',
+      path: '/v1' + path,
+      method: method,
       headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Storefront-Access-Token': SHOPIFY_STOREFRONT_TOKEN,
+        'Authorization': 'Bearer ' + STRIPE_SECRET,
+        'Content-Type': 'application/x-www-form-urlencoded',
         'Content-Length': Buffer.byteLength(body)
       }
     };
+
     var req = https.request(options, function(res) {
       var chunks = [];
       res.on('data', function(c) { chunks.push(c); });
@@ -43,62 +46,146 @@ function shopifyQuery(query) {
       });
     });
     req.on('error', reject);
-    req.write(body);
+    if (body) req.write(body);
     req.end();
   });
 }
 
-app.post('/login', async function(req, res) {
-  var email    = (req.body.email || '').replace(/"/g, '');
-  var password = (req.body.password || '').replace(/"/g, '');
+// in-memory subscriber store
+var subscribers = {};
 
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required.' });
+// health check
+app.get('/', function(req, res) {
+  res.json({ status: 'ClickColor server running' });
+});
+
+// ══════════════════════════════════════
+// CREATE CHECKOUT SESSION
+// Called when user clicks Subscribe
+// Returns a Stripe checkout URL
+// ══════════════════════════════════════
+app.post('/create-checkout', async function(req, res) {
+  var email       = (req.body.email || '').trim();
+  var successUrl  = req.body.successUrl || 'https://your-netlify-site.netlify.app?pro=true';
+  var cancelUrl   = req.body.cancelUrl  || 'https://your-netlify-site.netlify.app';
+
+  try {
+    var session = await stripeRequest('POST', '/checkout/sessions', {
+      'payment_method_types[]':        'card',
+      'line_items[0][price]':          STRIPE_PRICE_ID,
+      'line_items[0][quantity]':       '1',
+      'mode':                          'subscription',
+      'customer_email':                email,
+      'success_url':                   successUrl + '&session_id={CHECKOUT_SESSION_ID}',
+      'cancel_url':                    cancelUrl
+    });
+
+    if (session.error) {
+      return res.status(400).json({ error: session.error.message });
+    }
+
+    return res.json({ url: session.url });
+
+  } catch(e) {
+    console.error('Checkout error:', e.message);
+    return res.status(500).json({ error: 'Could not create checkout session.' });
+  }
+});
+
+// ══════════════════════════════════════
+// CHECK SUBSCRIBER
+// Called on login — checks if email
+// has an active Stripe subscription
+// ══════════════════════════════════════
+app.post('/check-subscriber', async function(req, res) {
+  var email = (req.body.email || '').toLowerCase().trim();
+
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required.' });
   }
 
   try {
-    var tokenData = await shopifyQuery(
-      'mutation { customerAccessTokenCreate(input: { email: "' + email + '", password: "' + password + '" }) { customerAccessToken { accessToken } customerUserErrors { message } } }'
+    // check in-memory list first (fastest)
+    if (subscribers[email]) {
+      return res.json({ isPro: true, email: email });
+    }
+
+    // search Stripe for a customer with this email
+    var customers = await stripeRequest('GET',
+      '/customers?email=' + encodeURIComponent(email) + '&limit=1', null
     );
 
-    var tokenResult = tokenData.data && tokenData.data.customerAccessTokenCreate;
-    if (!tokenResult || tokenResult.customerUserErrors.length > 0) {
-      return res.status(401).json({ error: 'Invalid email or password.' });
+    if (!customers.data || customers.data.length === 0) {
+      return res.json({ isPro: false, email: email });
     }
 
-    var accessToken = tokenResult.customerAccessToken.accessToken;
+    var customerId = customers.data[0].id;
 
-    var customerData = await shopifyQuery(
-      '{ customer(customerAccessToken: "' + accessToken + '") { firstName lastName orders(first: 20) { edges { node { financialStatus lineItems(first: 5) { edges { node { title } } } } } } } }'
+    // check if they have an active subscription
+    var subscriptions = await stripeRequest('GET',
+      '/subscriptions?customer=' + customerId + '&status=active&limit=1', null
     );
 
-    var customer = customerData.data && customerData.data.customer;
-    if (!customer) {
-      return res.status(401).json({ error: 'Could not load account.' });
-    }
+    var isPro = subscriptions.data && subscriptions.data.length > 0;
 
-    var name = [customer.firstName, customer.lastName].filter(Boolean).join(' ') || email;
+    if (isPro) subscribers[email] = true;
 
-    var isPro = false;
-    if (customer.orders && customer.orders.edges) {
-      customer.orders.edges.forEach(function(edge) {
-        if (edge.node.financialStatus === 'PAID') {
-          edge.node.lineItems.edges.forEach(function(item) {
-            var title = (item.node.title || '').toLowerCase();
-            if (title.includes('clickcolor') || title.includes('pro')) isPro = true;
-          });
-        }
-      });
-    }
-
-    return res.json({ name: name, email: email, isPro: isPro });
+    return res.json({ isPro: isPro, email: email });
 
   } catch(e) {
-    console.error('Login error:', e.message);
+    console.error('Subscriber check error:', e.message);
     return res.status(500).json({ error: 'Server error. Please try again.' });
   }
 });
 
+// ══════════════════════════════════════
+// STRIPE WEBHOOK
+// Stripe calls this when payment succeeds
+// ══════════════════════════════════════
+app.post('/webhook', async function(req, res) {
+  var sig  = req.headers['stripe-signature'];
+  var body = req.body;
+
+  // verify webhook signature
+  try {
+    var crypto  = require('crypto');
+    var parts   = sig.split(',').reduce(function(acc, part) {
+      var kv = part.split('=');
+      acc[kv[0]] = kv[1];
+      return acc;
+    }, {});
+
+    var timestamp  = parts.t;
+    var signature  = parts.v1;
+    var payload    = timestamp + '.' + body.toString();
+    var expected   = crypto.createHmac('sha256', STRIPE_WEBHOOK).update(payload).digest('hex');
+
+    if (expected !== signature) {
+      console.log('Webhook signature mismatch');
+      return res.sendStatus(401);
+    }
+  } catch(e) {
+    return res.sendStatus(400);
+  }
+
+  var event;
+  try { event = JSON.parse(body.toString()); }
+  catch(e) { return res.sendStatus(400); }
+
+  // handle successful payment
+  if (event.type === 'checkout.session.completed' ||
+      event.type === 'invoice.payment_succeeded') {
+    var email = event.data.object.customer_email ||
+                (event.data.object.customer_details && event.data.object.customer_details.email);
+    if (email) {
+      subscribers[email.toLowerCase()] = true;
+      console.log('New Pro subscriber:', email);
+    }
+  }
+
+  res.sendStatus(200);
+});
+
 app.listen(PORT, function() {
-  console.log('Server running on port', PORT);
+  console.log('ClickColor server running on port', PORT);
 });
