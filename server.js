@@ -5,15 +5,13 @@ const crypto   = require('crypto');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── ENV VARS — set in Railway dashboard ──
 const STRIPE_SECRET    = process.env.STRIPE_SECRET;
 const STRIPE_WEBHOOK   = process.env.STRIPE_WEBHOOK;
 const STRIPE_PRICE_ID  = process.env.STRIPE_PRICE_ID;
-const SUPABASE_URL     = process.env.SUPABASE_URL;       // https://xxxx.supabase.co
-const SUPABASE_KEY     = process.env.SUPABASE_SERVICE_KEY; // service_role key
+const SUPABASE_URL     = process.env.SUPABASE_URL;
+const SUPABASE_KEY     = process.env.SUPABASE_SERVICE_KEY;
 const SITE_URL         = process.env.SITE_URL || 'https://clickingasaservice.com';
 
-// ── MIDDLEWARE ──
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
@@ -25,25 +23,21 @@ app.use(function(req, res, next) {
   next();
 });
 
-// ── PASSWORD HASHING ──
-// Uses SHA-256 with a salt — no extra dependencies needed
+/* ── PASSWORD HASHING ── */
 function hashPassword(password, salt) {
   if (!salt) salt = crypto.randomBytes(16).toString('hex');
   var hash = crypto.createHmac('sha256', salt).update(password).digest('hex');
   return { hash: hash, salt: salt };
 }
-
 function verifyPassword(password, salt, storedHash) {
-  var result = hashPassword(password, salt);
-  return result.hash === storedHash;
+  return hashPassword(password, salt).hash === storedHash;
 }
 
-// ── SUPABASE HELPER ──
+/* ── SUPABASE HELPER ── */
 function supabase(method, path, body) {
   return new Promise(function(resolve, reject) {
     var data = body ? JSON.stringify(body) : '';
     var url  = new URL(SUPABASE_URL + '/rest/v1' + path);
-
     var options = {
       hostname: url.hostname,
       path:     url.pathname + url.search,
@@ -55,9 +49,7 @@ function supabase(method, path, body) {
         'Prefer':        'return=representation'
       }
     };
-
     if (data) options.headers['Content-Length'] = Buffer.byteLength(data);
-
     var req = https.request(options, function(res) {
       var chunks = [];
       res.on('data', function(c) { chunks.push(c); });
@@ -73,13 +65,12 @@ function supabase(method, path, body) {
   });
 }
 
-// ── STRIPE HELPER ──
+/* ── STRIPE HELPER ── */
 function stripeRequest(method, path, data) {
   return new Promise(function(resolve, reject) {
     var body = data ? Object.keys(data).map(function(k) {
       return encodeURIComponent(k) + '=' + encodeURIComponent(data[k]);
     }).join('&') : '';
-
     var options = {
       hostname: 'api.stripe.com',
       path: '/v1' + path,
@@ -90,7 +81,6 @@ function stripeRequest(method, path, data) {
         'Content-Length': Buffer.byteLength(body)
       }
     };
-
     var req = https.request(options, function(res) {
       var chunks = [];
       res.on('data', function(c) { chunks.push(c); });
@@ -105,58 +95,63 @@ function stripeRequest(method, path, data) {
   });
 }
 
-// ── HEALTH CHECK ──
+/* ── HEALTH CHECK ── */
 app.get('/', function(req, res) {
   res.json({ status: 'Clicking as a Service server running' });
 });
 
-// ══════════════════════════════════════════
-// REGISTER
-// Creates a new user in Supabase
-// ══════════════════════════════════════════
+/* ══════════════════════════════════════════
+   REGISTER
+   Now accepts username, checks uniqueness
+══════════════════════════════════════════ */
 app.post('/register', async function(req, res) {
   var name     = (req.body.name     || '').trim();
+  var username = (req.body.username || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
   var email    = (req.body.email    || '').toLowerCase().trim();
   var password = (req.body.password || '');
 
-  if (!name || !email || !password) {
+  if (!name || !username || !email || !password) {
     return res.status(400).json({ error: 'All fields are required.' });
+  }
+  if (username.length < 3) {
+    return res.status(400).json({ error: 'Username must be at least 3 characters.' });
   }
   if (password.length < 6) {
     return res.status(400).json({ error: 'Password must be at least 6 characters.' });
   }
 
   try {
-    // Check if email already exists
-    var existing = await supabase('GET',
-      '/users?email=eq.' + encodeURIComponent(email) + '&select=id',
-      null
-    );
-
-    if (existing.data && existing.data.length > 0) {
+    // Check email exists
+    var existingEmail = await supabase('GET',
+      '/users?email=eq.' + encodeURIComponent(email) + '&select=id', null);
+    if (existingEmail.data && existingEmail.data.length > 0) {
       return res.status(400).json({ error: 'An account with this email already exists.' });
     }
 
-    // Hash the password
-    var hashed = hashPassword(password);
+    // Check username exists
+    var existingUser = await supabase('GET',
+      '/users?username=eq.' + encodeURIComponent(username) + '&select=id', null);
+    if (existingUser.data && existingUser.data.length > 0) {
+      return res.status(400).json({ error: 'That username is already taken.' });
+    }
 
-    // Insert new user
+    var hashed = hashPassword(password);
     var result = await supabase('POST', '/users', {
       name:          name,
+      username:      username,
       email:         email,
       password_hash: hashed.salt + ':' + hashed.hash,
-      is_pro:        false
+      is_pro:        false,
+      total_clicks:  0
     });
 
     if (result.status !== 201) {
-      console.error('Supabase insert error:', result.data);
       return res.status(500).json({ error: 'Could not create account. Please try again.' });
     }
 
     var user = Array.isArray(result.data) ? result.data[0] : result.data;
-    console.log('New user registered:', email);
-
-    return res.json({ success: true, name: user.name, email: user.email, isPro: false });
+    console.log('New user registered:', email, '| username:', username);
+    return res.json({ success: true, name: user.name, username: user.username, email: user.email, isPro: false });
 
   } catch(e) {
     console.error('Register error:', e.message);
@@ -164,11 +159,10 @@ app.post('/register', async function(req, res) {
   }
 });
 
-// ══════════════════════════════════════════
-// LOGIN
-// Verifies password against Supabase,
-// checks Stripe for active subscription
-// ══════════════════════════════════════════
+/* ══════════════════════════════════════════
+   LOGIN
+   Returns username along with other fields
+══════════════════════════════════════════ */
 app.post('/login', async function(req, res) {
   var email    = (req.body.email    || '').toLowerCase().trim();
   var password = (req.body.password || '');
@@ -178,65 +172,47 @@ app.post('/login', async function(req, res) {
   }
 
   try {
-    // Look up user in Supabase
     var result = await supabase('GET',
-      '/users?email=eq.' + encodeURIComponent(email) + '&select=*',
-      null
-    );
+      '/users?email=eq.' + encodeURIComponent(email) + '&select=*', null);
 
     if (!result.data || result.data.length === 0) {
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
 
-    var user = result.data[0];
-
-    // Verify password
+    var user  = result.data[0];
     var parts = (user.password_hash || '').split(':');
-    if (parts.length !== 2) {
+    if (parts.length !== 2 || !verifyPassword(password, parts[0], parts[1])) {
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
 
-    var salt       = parts[0];
-    var storedHash = parts[1];
-
-    if (!verifyPassword(password, salt, storedHash)) {
-      return res.status(401).json({ error: 'Invalid email or password.' });
-    }
-
-    // Check Pro status — use stored flag first, then verify with Stripe
     var isPro = !!user.is_pro;
 
     if (!isPro && STRIPE_SECRET) {
       try {
         var customers = await stripeRequest('GET',
-          '/customers?email=' + encodeURIComponent(email) + '&limit=1',
-          null
-        );
-
+          '/customers?email=' + encodeURIComponent(email) + '&limit=1', null);
         if (customers.data && customers.data.length > 0) {
-          var customerId = customers.data[0].id;
           var subs = await stripeRequest('GET',
-            '/subscriptions?customer=' + customerId + '&status=active&limit=1',
-            null
-          );
-
+            '/subscriptions?customer=' + customers.data[0].id + '&status=active&limit=1', null);
           if (subs.data && subs.data.length > 0) {
             isPro = true;
-            // Update Supabase so next login is faster
             await supabase('PATCH',
               '/users?email=eq.' + encodeURIComponent(email),
-              { is_pro: true, stripe_customer_id: customerId }
-            );
+              { is_pro: true });
           }
         }
-      } catch(stripeErr) {
-        console.error('Stripe check error:', stripeErr.message);
-        // Non-fatal — continue with Supabase value
-      }
+      } catch(e) { console.error('Stripe check error:', e.message); }
     }
 
     console.log('Login:', email, '| Pro:', isPro);
-    return res.json({ success: true, name: user.name, email: user.email, isPro: isPro });
+    return res.json({
+      success:  true,
+      name:     user.name,
+      username: user.username || user.name,
+      email:    user.email,
+      isPro:    isPro,
+      total_clicks: user.total_clicks || 0
+    });
 
   } catch(e) {
     console.error('Login error:', e.message);
@@ -244,17 +220,94 @@ app.post('/login', async function(req, res) {
   }
 });
 
-// ══════════════════════════════════════════
-// CREATE CHECKOUT SESSION
-// ══════════════════════════════════════════
+/* ══════════════════════════════════════════
+   RECORD CLICK
+   Increments total_clicks for logged-in user
+══════════════════════════════════════════ */
+app.post('/click', async function(req, res) {
+  var email = (req.body.email || '').toLowerCase().trim();
+  if (!email) return res.status(400).json({ error: 'Email required.' });
+
+  try {
+    /* Use Supabase RPC to safely increment */
+    var result = await supabase('GET',
+      '/users?email=eq.' + encodeURIComponent(email) + '&select=total_clicks', null);
+
+    if (!result.data || result.data.length === 0) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    var current = result.data[0].total_clicks || 0;
+    await supabase('PATCH',
+      '/users?email=eq.' + encodeURIComponent(email),
+      { total_clicks: current + 1 }
+    );
+
+    return res.json({ success: true, total_clicks: current + 1 });
+  } catch(e) {
+    console.error('Click error:', e.message);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+/* ══════════════════════════════════════════
+   LEADERBOARD
+   Returns top 20 users by total_clicks
+══════════════════════════════════════════ */
+app.get('/leaderboard', async function(req, res) {
+  try {
+    var result = await supabase('GET',
+      '/users?select=username,total_clicks&order=total_clicks.desc&limit=20', null);
+
+    if (!result.data) return res.json({ leaders: [] });
+
+    var leaders = result.data
+      .filter(function(u) { return u.total_clicks > 0; })
+      .map(function(u, i) {
+        return {
+          rank:         i + 1,
+          username:     u.username || 'anonymous',
+          total_clicks: u.total_clicks || 0
+        };
+      });
+
+    return res.json({ leaders: leaders });
+  } catch(e) {
+    console.error('Leaderboard error:', e.message);
+    return res.status(500).json({ leaders: [] });
+  }
+});
+
+/* ══════════════════════════════════════════
+   CHECK SUBSCRIBER
+══════════════════════════════════════════ */
+app.post('/check-subscriber', async function(req, res) {
+  var email = (req.body.email || '').toLowerCase().trim();
+  if (!email) return res.status(400).json({ error: 'Email required.' });
+
+  try {
+    var customers = await stripeRequest('GET',
+      '/customers?email=' + encodeURIComponent(email) + '&limit=1', null);
+    if (!customers.data || customers.data.length === 0) {
+      return res.json({ isPro: false, email: email });
+    }
+    var subs = await stripeRequest('GET',
+      '/subscriptions?customer=' + customers.data[0].id + '&status=active&limit=1', null);
+    var isPro = !!(subs.data && subs.data.length > 0);
+    return res.json({ isPro: isPro, email: email });
+  } catch(e) {
+    console.error('Subscriber check error:', e.message);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+/* ══════════════════════════════════════════
+   CREATE CHECKOUT SESSION
+══════════════════════════════════════════ */
 app.post('/create-checkout', async function(req, res) {
   var email      = (req.body.email || '').trim();
   var successUrl = req.body.successUrl || SITE_URL + '?pro=true';
   var cancelUrl  = req.body.cancelUrl  || SITE_URL;
-
-  if (!STRIPE_SECRET) {
-    return res.status(500).json({ error: 'Payment system not configured.' });
-  }
 
   try {
     var params = {
@@ -268,24 +321,17 @@ app.post('/create-checkout', async function(req, res) {
     if (email) params['customer_email'] = email;
 
     var session = await stripeRequest('POST', '/checkout/sessions', params);
-
-    if (session.error) {
-      return res.status(400).json({ error: session.error.message });
-    }
-
-    console.log('Checkout session created for:', email || 'anonymous');
+    if (session.error) return res.status(400).json({ error: session.error.message });
     return res.json({ url: session.url });
-
   } catch(e) {
     console.error('Checkout error:', e.message);
     return res.status(500).json({ error: 'Could not create checkout session.' });
   }
 });
 
-// ══════════════════════════════════════════
-// STRIPE WEBHOOK
-// Marks user as Pro in Supabase on payment
-// ══════════════════════════════════════════
+/* ══════════════════════════════════════════
+   STRIPE WEBHOOK
+══════════════════════════════════════════ */
 app.post('/webhook', async function(req, res) {
   var sig  = req.headers['stripe-signature'];
   var body = req.body;
@@ -297,10 +343,7 @@ app.post('/webhook', async function(req, res) {
       }, {});
       var payload  = parts.t + '.' + body.toString();
       var expected = crypto.createHmac('sha256', STRIPE_WEBHOOK).update(payload).digest('hex');
-      if (expected !== parts.v1) {
-        console.log('Webhook signature mismatch');
-        return res.sendStatus(401);
-      }
+      if (expected !== parts.v1) return res.sendStatus(401);
     } catch(e) { return res.sendStatus(400); }
   }
 
@@ -313,38 +356,25 @@ app.post('/webhook', async function(req, res) {
     var obj   = event.data.object;
     var email = obj.customer_email ||
                 (obj.customer_details && obj.customer_details.email);
-
     if (email) {
-      email = email.toLowerCase();
-      console.log('Payment confirmed for:', email);
-
-      // Mark user as Pro in Supabase
       try {
         await supabase('PATCH',
-          '/users?email=eq.' + encodeURIComponent(email),
-          { is_pro: true }
-        );
-        console.log('Marked as Pro in Supabase:', email);
-      } catch(e) {
-        console.error('Supabase update error:', e.message);
-      }
+          '/users?email=eq.' + encodeURIComponent(email.toLowerCase()),
+          { is_pro: true });
+        console.log('Marked as Pro:', email);
+      } catch(e) { console.error('Supabase update error:', e.message); }
     }
   }
 
-  // Handle subscription cancellation
   if (event.type === 'customer.subscription.deleted') {
     var custEmail = event.data.object.customer_email;
     if (custEmail) {
-      custEmail = custEmail.toLowerCase();
       try {
         await supabase('PATCH',
-          '/users?email=eq.' + encodeURIComponent(custEmail),
-          { is_pro: false }
-        );
-        console.log('Removed Pro from:', custEmail);
-      } catch(e) {
-        console.error('Supabase update error:', e.message);
-      }
+          '/users?email=eq.' + encodeURIComponent(custEmail.toLowerCase()),
+          { is_pro: false });
+        console.log('Removed Pro:', custEmail);
+      } catch(e) { console.error('Supabase update error:', e.message); }
     }
   }
 
