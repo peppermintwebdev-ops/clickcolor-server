@@ -404,17 +404,46 @@ app.post('/webhook', async function(req, res) {
   try { event = JSON.parse(body.toString()); }
   catch(e) { return res.sendStatus(400); }
 
-  if (event.type === 'checkout.session.completed' ||
-      event.type === 'invoice.payment_succeeded') {
+  if (event.type === 'checkout.session.completed') {
     var obj   = event.data.object;
     var email = obj.customer_email ||
                 (obj.customer_details && obj.customer_details.email);
-    if (email) {
+
+    if (obj.mode === 'subscription' && email) {
+      /* Subscription purchase — mark as Pro */
       try {
         await supabase('PATCH',
           '/users?email=eq.' + encodeURIComponent(email.toLowerCase()),
           { is_pro: true });
         console.log('Marked as Pro:', email);
+      } catch(e) { console.error('Supabase update error:', e.message); }
+
+    } else if (obj.mode === 'payment' && email) {
+      /* One-time item purchase — save to purchases table */
+      var itemId = obj.metadata && obj.metadata.item_id;
+      var item   = itemId && SHOP_ITEMS[itemId];
+      if (item) {
+        try {
+          await supabase('POST', '/purchases', {
+            user_email: email.toLowerCase(),
+            item_id:    itemId,
+            item_type:  item.type,
+            price:      item.amount
+          });
+          console.log('Purchase saved:', itemId, 'for', email);
+        } catch(e) { console.error('Purchase save error:', e.message); }
+      }
+    }
+  }
+
+  if (event.type === 'invoice.payment_succeeded') {
+    var obj   = event.data.object;
+    var email = obj.customer_email;
+    if (email) {
+      try {
+        await supabase('PATCH',
+          '/users?email=eq.' + encodeURIComponent(email.toLowerCase()),
+          { is_pro: true });
       } catch(e) { console.error('Supabase update error:', e.message); }
     }
   }
@@ -496,6 +525,83 @@ app.post('/comments', async function(req, res) {
 
   } catch(e) {
     console.error('Post comment error:', e.message);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+/* ══════════════════════════════════════════
+   SHOP ITEMS
+   Price IDs for skins and sounds
+══════════════════════════════════════════ */
+var SHOP_ITEMS = {
+  'skin-neon':    { price: 'price_1TY8a1CNzHTD0Po9UOY1acbu', name: 'Neon Skin',    type: 'skin',  amount: 0.99 },
+  'skin-galaxy':  { price: 'price_1TY8aDCNzHTD0Po9olfPNx3q', name: 'Galaxy Skin',  type: 'skin',  amount: 0.99 },
+  'skin-pixel':   { price: 'price_1TY8aRCNzHTD0Po9unpjSaBh', name: 'Pixel Skin',   type: 'skin',  amount: 0.99 },
+  'sound-pop':    { price: 'price_1TY8acCNzHTD0Po95Ja19rUL', name: 'Pop Sound',    type: 'sound', amount: 0.99 },
+  'sound-click':  { price: 'price_1TY8anCNzHTD0Po9Ip2S2uXv', name: 'Click Sound',  type: 'sound', amount: 0.99 },
+  'sound-coin':   { price: 'price_1TY8c0CNzHTD0Po9vKuFiGTV', name: 'Coin Sound',   type: 'sound', amount: 0.99 },
+};
+
+/* ══════════════════════════════════════════
+   CREATE ITEM CHECKOUT
+   One-time purchase for individual skin/sound
+══════════════════════════════════════════ */
+app.post('/create-item-checkout', async function(req, res) {
+  var email   = (req.body.email  || '').trim();
+  var itemId  = (req.body.itemId || '').trim();
+  var item    = SHOP_ITEMS[itemId];
+
+  if (!item) return res.status(400).json({ error: 'Invalid item.' });
+  if (!email) return res.status(400).json({ error: 'Please sign in to purchase.' });
+
+  try {
+    /* Check if already owned */
+    var existing = await supabase('GET',
+      '/purchases?user_email=eq.' + encodeURIComponent(email) + '&item_id=eq.' + encodeURIComponent(itemId) + '&select=id',
+      null
+    );
+    if (existing.data && existing.data.length > 0) {
+      return res.status(400).json({ error: 'You already own this item.' });
+    }
+
+    var session = await stripeRequest('POST', '/checkout/sessions', {
+      'payment_method_types[]':  'card',
+      'line_items[0][price]':    item.price,
+      'line_items[0][quantity]': '1',
+      'mode':                    'payment',
+      'customer_email':          email,
+      'success_url':             SITE_URL + '?item=' + itemId + '&purchased=true',
+      'cancel_url':              SITE_URL,
+      'metadata[item_id]':       itemId,
+      'metadata[user_email]':    email,
+    });
+
+    if (session.error) return res.status(400).json({ error: session.error.message });
+    return res.json({ url: session.url });
+
+  } catch(e) {
+    console.error('Item checkout error:', e.message);
+    return res.status(500).json({ error: 'Could not create checkout.' });
+  }
+});
+
+/* ══════════════════════════════════════════
+   GET PURCHASES
+   Returns all items owned by a user
+══════════════════════════════════════════ */
+app.post('/get-purchases', async function(req, res) {
+  var email = (req.body.email || '').toLowerCase().trim();
+  if (!email) return res.status(400).json({ error: 'Email required.' });
+
+  try {
+    var result = await supabase('GET',
+      '/purchases?user_email=eq.' + encodeURIComponent(email) + '&select=item_id,item_type',
+      null
+    );
+    var owned = (result.data || []).map(function(p) { return p.item_id; });
+    return res.json({ owned: owned });
+  } catch(e) {
+    console.error('Get purchases error:', e.message);
     return res.status(500).json({ error: 'Server error.' });
   }
 });
