@@ -101,6 +101,59 @@ app.get('/', function(req, res) {
 });
 
 /* ══════════════════════════════════════════
+   SESSION RESTORE
+   Checks Pro status by email only —
+   no password needed, called on page load
+══════════════════════════════════════════ */
+app.post('/session', async function(req, res) {
+  var email = (req.body.email || '').toLowerCase().trim();
+  if (!email) return res.status(400).json({ error: 'Email required.' });
+
+  try {
+    var result = await supabase('GET',
+      '/users?email=eq.' + encodeURIComponent(email) + '&select=name,username,is_pro',
+      null
+    );
+
+    if (!result.data || result.data.length === 0) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    var user  = result.data[0];
+    var isPro = !!user.is_pro;
+
+    /* Double check with Stripe if not marked Pro in DB */
+    if (!isPro && STRIPE_SECRET) {
+      try {
+        var customers = await stripeRequest('GET',
+          '/customers?email=' + encodeURIComponent(email) + '&limit=1', null);
+        if (customers.data && customers.data.length > 0) {
+          var subs = await stripeRequest('GET',
+            '/subscriptions?customer=' + customers.data[0].id + '&status=active&limit=1', null);
+          if (subs.data && subs.data.length > 0) {
+            isPro = true;
+            await supabase('PATCH',
+              '/users?email=eq.' + encodeURIComponent(email),
+              { is_pro: true });
+          }
+        }
+      } catch(e) { console.error('Stripe session check:', e.message); }
+    }
+
+    return res.json({
+      name:     user.name,
+      username: user.username,
+      email:    email,
+      isPro:    isPro
+    });
+
+  } catch(e) {
+    console.error('Session error:', e.message);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+/* ══════════════════════════════════════════
    REGISTER
    Now accepts username, checks uniqueness
 ══════════════════════════════════════════ */
