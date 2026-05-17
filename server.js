@@ -434,6 +434,72 @@ app.post('/webhook', async function(req, res) {
   res.sendStatus(200);
 });
 
+/* ══════════════════════════════════════════
+   GET COMMENTS
+   Returns all comments for an article slug
+══════════════════════════════════════════ */
+app.get('/comments/:slug', async function(req, res) {
+  var slug = req.params.slug;
+  if (!slug) return res.status(400).json({ error: 'Slug required.' });
+  try {
+    var result = await supabase('GET',
+      '/comments?article_slug=eq.' + encodeURIComponent(slug) + '&order=created_at.asc&select=id,username,body,created_at',
+      null
+    );
+    return res.json({ comments: result.data || [] });
+  } catch(e) {
+    console.error('Get comments error:', e.message);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+/* ══════════════════════════════════════════
+   POST COMMENT
+   Saves a comment — requires logged in user
+══════════════════════════════════════════ */
+app.post('/comments', async function(req, res) {
+  var email = (req.body.email || '').toLowerCase().trim();
+  var slug  = (req.body.slug  || '').trim();
+  var body  = (req.body.body  || '').trim();
+
+  if (!email || !slug || !body) {
+    return res.status(400).json({ error: 'All fields are required.' });
+  }
+  if (body.length > 1000) {
+    return res.status(400).json({ error: 'Comment must be under 1000 characters.' });
+  }
+
+  try {
+    var userResult = await supabase('GET',
+      '/users?email=eq.' + encodeURIComponent(email) + '&select=username',
+      null
+    );
+    if (!userResult.data || userResult.data.length === 0) {
+      return res.status(401).json({ error: 'Account not found. Please sign in.' });
+    }
+    var username = userResult.data[0].username || email.split('@')[0];
+
+    var result = await supabase('POST', '/comments', {
+      article_slug: slug,
+      user_email:   email,
+      username:     username,
+      body:         body
+    });
+
+    if (result.status !== 201) {
+      return res.status(500).json({ error: 'Could not post comment.' });
+    }
+
+    var comment = Array.isArray(result.data) ? result.data[0] : result.data;
+    console.log('New comment on', slug, 'by', username);
+    return res.json({ success: true, comment: { username: username, body: body, created_at: comment.created_at } });
+
+  } catch(e) {
+    console.error('Post comment error:', e.message);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
 app.listen(PORT, function() {
   console.log('Clicking as a Service server running on port', PORT);
 });
