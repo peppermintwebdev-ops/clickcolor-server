@@ -534,12 +534,20 @@ app.post('/comments', async function(req, res) {
    Price IDs for skins and sounds
 ══════════════════════════════════════════ */
 var SHOP_ITEMS = {
-  'skin-neon':    { price: 'price_1TY8a1CNzHTD0Po9UOY1acbu', name: 'Neon Skin',    type: 'skin',  amount: 0.99 },
-  'skin-galaxy':  { price: 'price_1TY8aDCNzHTD0Po9olfPNx3q', name: 'Galaxy Skin',  type: 'skin',  amount: 0.99 },
-  'skin-pixel':   { price: 'price_1TY8aRCNzHTD0Po9unpjSaBh', name: 'Pixel Skin',   type: 'skin',  amount: 0.99 },
-  'sound-pop':    { price: 'price_1TY8acCNzHTD0Po95Ja19rUL', name: 'Pop Sound',    type: 'sound', amount: 0.99 },
-  'sound-click':  { price: 'price_1TY8anCNzHTD0Po9Ip2S2uXv', name: 'Click Sound',  type: 'sound', amount: 0.99 },
-  'sound-coin':   { price: 'price_1TY8c0CNzHTD0Po9vKuFiGTV', name: 'Coin Sound',   type: 'sound', amount: 0.99 },
+  'skin-neon':      { price: 'price_1TY8a1CNzHTD0Po9UOY1acbu', name: 'Neon Skin',      type: 'skin',  amount: 0.99 },
+  'skin-galaxy':    { price: 'price_1TY8aDCNzHTD0Po9olfPNx3q', name: 'Galaxy Skin',    type: 'skin',  amount: 0.99 },
+  'skin-pixel':     { price: 'price_1TY8aRCNzHTD0Po9unpjSaBh', name: 'Pixel Skin',     type: 'skin',  amount: 0.99 },
+  'skin-liquid':    { price: 'price_1TZZLUCNzHTD0Po9SrMtDCAS', name: 'Liquid Skin',    type: 'skin',  amount: 0.99 },
+  'skin-retro':     { price: 'price_1TZZM5CNzHTD0Po9u2ybPwtZ', name: 'Retro Skin',     type: 'skin',  amount: 0.99 },
+  'skin-hologram':  { price: 'price_1TZZMLCNzHTD0Po9fUeJLdBK', name: 'Hologram Skin',  type: 'skin',  amount: 0.99 },
+  'skin-crystal':   { price: 'price_1TZZMYCNzHTD0Po9Im0arDGW', name: 'Crystal Skin',   type: 'skin',  amount: 0.99 },
+  'sound-pop':      { price: 'price_1TY8acCNzHTD0Po95Ja19rUL', name: 'Pop Sound',      type: 'sound', amount: 0.99 },
+  'sound-click':    { price: 'price_1TY8anCNzHTD0Po9Ip2S2uXv', name: 'Click Sound',    type: 'sound', amount: 0.99 },
+  'sound-coin':     { price: 'price_1TY8c0CNzHTD0Po9vKuFiGTV', name: 'Coin Sound',     type: 'sound', amount: 0.99 },
+  'sound-beep':     { price: 'price_1TZZMkCNzHTD0Po9qlELq6Ob', name: 'Beep Sound',     type: 'sound', amount: 0.99 },
+  'sound-whoosh':   { price: 'price_1TZZMuCNzHTD0Po9IyBzamgL', name: 'Whoosh Sound',   type: 'sound', amount: 0.99 },
+  'sound-ding':     { price: 'price_1TZZN5CNzHTD0Po95U46llEg', name: 'Ding Sound',     type: 'sound', amount: 0.99 },
+  'sound-zap':      { price: 'price_1TZZNFCNzHTD0Po9gD7jO939', name: 'Zap Sound',      type: 'sound', amount: 0.99 },
 };
 
 /* ══════════════════════════════════════════
@@ -602,6 +610,64 @@ app.post('/get-purchases', async function(req, res) {
     return res.json({ owned: owned });
   } catch(e) {
     console.error('Get purchases error:', e.message);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+/* ══════════════════════════════════════════
+   GET ACHIEVEMENTS
+   Returns user's unlocked achievements
+══════════════════════════════════════════ */
+app.post('/get-achievements', async function(req, res) {
+  var email = (req.body.email || '').toLowerCase().trim();
+  if (!email) return res.status(400).json({ error: 'Email required.' });
+
+  try {
+    var result = await supabase('GET',
+      '/achievements?user_email=eq.' + encodeURIComponent(email) + '&select=achievement_id,unlocked_at',
+      null
+    );
+    var unlocked = (result.data || []).map(function(a) { return a.achievement_id; });
+    return res.json({ unlocked: unlocked });
+  } catch(e) {
+    console.error('Get achievements error:', e.message);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+/* ══════════════════════════════════════════
+   UNLOCK ACHIEVEMENT
+   Records an achievement unlock
+══════════════════════════════════════════ */
+app.post('/unlock-achievement', async function(req, res) {
+  var email = (req.body.email || '').toLowerCase().trim();
+  var achId = (req.body.achievementId || '').trim();
+  if (!email || !achId) return res.status(400).json({ error: 'Missing data.' });
+
+  try {
+    /* Check if already unlocked */
+    var existing = await supabase('GET',
+      '/achievements?user_email=eq.' + encodeURIComponent(email) + '&achievement_id=eq.' + encodeURIComponent(achId) + '&select=id',
+      null
+    );
+    if (existing.data && existing.data.length > 0) {
+      return res.json({ alreadyUnlocked: true });
+    }
+
+    /* Unlock it */
+    var result = await supabase('POST', '/achievements', {
+      user_email:     email,
+      achievement_id: achId
+    });
+
+    if (result.status === 201) {
+      console.log('Achievement unlocked:', achId, 'for', email);
+      return res.json({ success: true });
+    }
+    return res.status(500).json({ error: 'Could not unlock.' });
+
+  } catch(e) {
+    console.error('Unlock achievement error:', e.message);
     return res.status(500).json({ error: 'Server error.' });
   }
 });
